@@ -10,6 +10,7 @@ from .solver import CsvFormatError, build_export_csv, solve_csv
 
 BASE_DIR = Path(__file__).resolve().parent
 SAMPLE_PATH = BASE_DIR.parent / "samples" / "dst_sample.csv"
+LONG_SAMPLE_PATH = BASE_DIR.parent / "samples" / "long_chain_sample.csv"
 INDEX_PATH = BASE_DIR / "static" / "index.html"
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
 
@@ -36,6 +37,13 @@ async def sample():
     """内置夏令时样例，可直接下载或在前端一键载入。"""
     return FileResponse(SAMPLE_PATH, media_type="text/csv; charset=utf-8",
                         filename="dst_sample.csv")
+
+
+@app.get("/api/sample/long", include_in_schema=False)
+async def long_sample():
+    """1200 段长链样例（含唯一解机尾与末尾冲突机尾），用于演示长链求解。"""
+    return FileResponse(LONG_SAMPLE_PATH, media_type="text/csv; charset=utf-8",
+                        filename="long_chain_sample.csv")
 
 
 @app.post("/api/solve")

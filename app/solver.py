@@ -35,10 +35,12 @@ _DT_FORMATS = (
     "%Y-%m-%dT%H:%M:%S",
 )
 
-# 枚举整链解时的硬上限（每条链至多 4^N 条路径，实际远小于此）
+# 多解时实际枚举并返回给前端展示的候选条数上限（分类本身不受此上限影响）
 SOLUTION_CAP = 200
 # 多解时返回给前端展示的候选条数
 MAX_DISPLAY_SOLUTIONS = 20
+# 路径计数饱和值：达到该值即认定为“多解”，避免超大整数运算
+_COUNT_SATURATED = SOLUTION_CAP + 1
 
 
 class CsvFormatError(Exception):
@@ -259,75 +261,200 @@ def build_segment(raw: RawRow):
 
 
 # ---------------------------------------------------------------------------
-# 整链求解
+# 整链求解（迭代式分层动态规划，无递归、不枚举完整路径）
 # ---------------------------------------------------------------------------
+#
+# 模型：按 seq 排序后，每层（航段）的每个可行 Combo 是一个节点；
+# 层间按「下一段起飞 >= 上一段落地」连边，得到一张分层 DAG。
+# 整链解 = 从第一层到最后一层的路径。
+#
+# 与“把搜索中断当成多解”的旧做法不同，这里分三遍扫描，全程 O(N*K^2)：
+#   1) 前向：每个节点记录可达路径数（饱和到 _COUNT_SATURATED）与前驱列表；
+#   2) 后向：标记哪些节点能走到链尾；
+#   3) 判定：总路径数 0=无解、1=唯一解、>=2=多解（精确区分，与枚举上限无关）。
+# 唯一解直接沿前驱回溯；多解时展示用的候选链才做限量枚举（迭代、有硬上限）。
+# 注意：路径计数的单位是“完整 UTC 链”，两条链即使末段落地时刻相同，
+# 只要中间任一 Combo 不同就是两条路径，仍判定为多解。
 
-def enumerate_solutions(segments: list):
-    """DFS 枚举整条航段链的全部可行解，返回 (solutions, truncated)。"""
-    solutions = []
-    truncated = False
+@dataclass
+class _Node:
+    """分层 DAG 中的一个节点（某个航段的一个可行 Combo）。"""
+    combo: Combo
+    count: int = 0                 # 从链首到该节点的可行路径数（饱和计数）
+    preds: list = field(default_factory=list)  # list[_Node]：上一层可衔接节点
+    viable: bool = False          # 该节点能否走到最后一层
+
+
+def _build_layers(segments: list) -> list:
+    """前向扫描构建分层 DAG。返回每层的节点列表（某层为空即链断裂）。"""
+    layers = []
+    prev_nodes = None
+    for seg in segments:
+        nodes = [_Node(combo=c) for c in seg.combos]
+        if prev_nodes is None:
+            # 链首：每个 combo 自身都是一条前缀路径
+            for nd in nodes:
+                nd.count = 1
+        else:
+            for nd in nodes:
+                total = 0
+                for p in prev_nodes:
+                    if nd.combo.dep_utc >= p.combo.arr_utc:
+                        nd.preds.append(p)
+                        total += p.count
+                        if total >= _COUNT_SATURATED:
+                            total = _COUNT_SATURATED
+                            break
+                nd.count = total
+        if not nodes:
+            break  # 该层无可行节点，不加入 layers，冲突按 duration_window 定位
+        layers.append(nodes)
+        prev_nodes = nodes
+    return layers
+
+
+def _mark_viable(layers: list) -> None:
+    """后向扫描：沿前驱边标记能走到链尾的节点。"""
+    if not layers or not layers[-1]:
+        return
+    for nd in layers[-1]:
+        nd.viable = True
+    for li in range(len(layers) - 1, 0, -1):
+        for nxt in layers[li]:
+            if not nxt.viable:
+                continue
+            for p in nxt.preds:
+                p.viable = True
+
+
+def _total_count(segments: list, layers: list) -> int:
+    """完整链路径数。层构建在中途断裂（某层无可行 combo）时整链无解。"""
+    if len(layers) != len(segments):
+        return 0
+    if not layers or not layers[-1]:
+        return 0
+    total = sum(nd.count for nd in layers[-1])
+    return min(total, _COUNT_SATURATED)
+
+
+def _reconstruct_unique(layers: list) -> list:
+    """总路径数恰好为 1 时，沿前驱回溯唯一 Combo 链（按层顺序返回）。"""
     path = []
+    cur = next(nd for nd in layers[-1] if nd.count > 0)
+    path.append(cur.combo)
+    for li in range(len(layers) - 1, 0, -1):
+        cur = next(p for p in cur.preds if p.count > 0)
+        path.append(cur.combo)
+    path.reverse()
+    return path
 
-    def dfs(i: int, prev_arr):
-        nonlocal truncated
-        if truncated:
-            return
-        if i == len(segments):
-            solutions.append(list(path))
-            if len(solutions) >= SOLUTION_CAP:
-                truncated = True
-            return
-        for combo in segments[i].combos:
-            if prev_arr is None or combo.dep_utc >= prev_arr:
-                path.append(combo)
-                dfs(i + 1, combo.arr_utc)
-                path.pop()
-                if truncated:
-                    return
 
-    dfs(0, None)
-    return solutions, truncated
+def _enumerate_capped(segments: list, layers: list, cap: int) -> list:
+    """多解时仅供展示的路径枚举：迭代 DFS，收集满 cap 条即停。
+
+    仅遍历 viable 节点，因此开销与“是否有解”的判定完全解耦——
+    无解时本函数不会被调用，不存在指数搜索。
+    """
+    solutions = []
+    # 栈帧：(层号, 该层待尝试的 viable 节点列表, 当前路径)
+    first = [nd for nd in layers[0] if nd.viable]
+    stack = [(0, first, [])]
+    while stack:
+        li, pending, path = stack[-1]
+        if not pending:
+            stack.pop()
+            continue
+        nd = pending.pop()
+        new_path = path + [nd.combo]
+        if li == len(layers) - 1:
+            solutions.append(new_path)
+            if len(solutions) >= cap:
+                return solutions
+            continue
+        nxt_nodes = [
+            n for n in layers[li + 1]
+            if n.viable and any(p is nd for p in n.preds)
+        ]
+        stack.append((li + 1, nxt_nodes, new_path))
+    return solutions
+
+
+def _conflict_from_layers(segments: list, layers: list) -> dict:
+    """依据前向 DAG 定位第一个无法衔接的航段（无解时调用）。"""
+    # 层为空：某航段没有任何满足时长区间的 combo
+    if len(layers) < len(segments):
+        seg = segments[len(layers)]
+        return {
+            "type": "duration_window",
+            "segment_seq": seg.seq,
+            "row": seg.row_number,
+            "message": (
+                f"航段 seq={seg.seq}（第 {seg.row_number} 行）没有任何 "
+                f"(起飞, 落地) 候选组合满足飞行时长闭区间 "
+                f"[{seg.dur_min}, {seg.dur_max}] 分钟"),
+            "dep_candidates": [iso(d) for d in seg.dep_candidates],
+            "arr_candidates": [iso(a) for a in seg.arr_candidates],
+            "previous_arrival_candidates": [],
+        }
+
+    # 首个 count 归零的层：该航段的所有 combo 都接不上前面任何可达落地
+    for li, nodes in enumerate(layers):
+        if any(nd.count > 0 for nd in nodes):
+            continue
+        seg = segments[li]
+        prev_arrs = sorted({nd.combo.arr_utc for nd in layers[li - 1]})
+        earliest_dep = min(nd.combo.dep_utc for nd in nodes)
+        latest_prev = prev_arrs[-1]
+        return {
+            "type": "chain_order",
+            "segment_seq": seg.seq,
+            "row": seg.row_number,
+            "message": (
+                f"航段 seq={seg.seq}（第 {seg.row_number} 行）无法衔接："
+                f"其最早可行起飞 {iso(earliest_dep)} 早于上一段最晚落地 "
+                f"{iso(latest_prev)}"),
+            "dep_candidates": sorted({iso(nd.combo.dep_utc) for nd in nodes}),
+            "arr_candidates": sorted({iso(nd.combo.arr_utc) for nd in nodes}),
+            "previous_arrival_candidates": [iso(pa) for pa in prev_arrs],
+        }
+
+    return {"type": "unknown", "message": "未能定位冲突", "segment_seq": None,
+            "row": None, "dep_candidates": [], "arr_candidates": [],
+            "previous_arrival_candidates": []}
 
 
 def analyze_conflict(segments: list) -> dict:
     """无解时定位冲突：前向扫描，找到第一个无法衔接的航段。"""
-    prev_arrs = [None]  # None 表示链首，无约束
-    for seg in segments:
-        if not seg.combos:
-            return {
-                "type": "duration_window",
-                "segment_seq": seg.seq,
-                "row": seg.row_number,
-                "message": (
-                    f"航段 seq={seg.seq}（第 {seg.row_number} 行）没有任何 "
-                    f"(起飞, 落地) 候选组合满足飞行时长闭区间 "
-                    f"[{seg.dur_min}, {seg.dur_max}] 分钟"),
-                "dep_candidates": [iso(d) for d in seg.dep_candidates],
-                "arr_candidates": [iso(a) for a in seg.arr_candidates],
-                "previous_arrival_candidates": [],
-            }
-        reachable = [c for c in seg.combos
-                     if any(pa is None or c.dep_utc >= pa for pa in prev_arrs)]
-        if not reachable:
-            earliest_dep = min(c.dep_utc for c in seg.combos)
-            latest_prev = max(pa for pa in prev_arrs if pa is not None)
-            return {
-                "type": "chain_order",
-                "segment_seq": seg.seq,
-                "row": seg.row_number,
-                "message": (
-                    f"航段 seq={seg.seq}（第 {seg.row_number} 行）无法衔接："
-                    f"其最早可行起飞 {iso(earliest_dep)} 早于上一段最晚落地 "
-                    f"{iso(latest_prev)}"),
-                "dep_candidates": sorted({iso(c.dep_utc) for c in seg.combos}),
-                "arr_candidates": sorted({iso(c.arr_utc) for c in seg.combos}),
-                "previous_arrival_candidates": [iso(pa) for pa in prev_arrs if pa],
-            }
-        prev_arrs = sorted({c.arr_utc for c in reachable})
-    # 理论上不会走到这里（前向可达非空 ⇔ 存在完整解）
-    return {"type": "unknown", "message": "未能定位冲突", "segment_seq": None,
-            "row": None, "dep_candidates": [], "arr_candidates": [],
-            "previous_arrival_candidates": []}
+    layers = _build_layers(segments)
+    return _conflict_from_layers(segments, layers)
+
+
+def solve_chain(segments: list) -> tuple:
+    """对已按 seq 升序排好的航段做整链求解（纯迭代，长链安全）。
+
+    返回 (status, payload)：
+    - ("unique", {"solution": [Combo...]})
+    - ("no_solution", {"conflict": {...}})
+    - ("multiple", {"solution_count", "solution_count_truncated", "solutions"})
+    """
+    layers = _build_layers(segments)
+    total = _total_count(segments, layers)
+
+    if total == 0:
+        return "no_solution", {"conflict": _conflict_from_layers(segments, layers)}
+
+    if total == 1:
+        return "unique", {"solution": _reconstruct_unique(layers)}
+
+    # 精确已知多解（total>=2）；展示用候选链才做限量枚举
+    _mark_viable(layers)
+    display = _enumerate_capped(segments, layers, SOLUTION_CAP)
+    truncated = total >= _COUNT_SATURATED or len(display) < total
+    return "multiple", {
+        "solution_count": total,
+        "solution_count_truncated": truncated,
+        "solutions": display,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -375,28 +502,32 @@ def solve_tail(tail: str, raws: list) -> dict:
         return {"tail": tail, "status": "error", "errors": errors}
 
     seqs = [s.seq for s in segments]
-    if len(set(seqs)) != len(seqs):
-        dup = sorted({s for s in seqs if seqs.count(s) > 1})
+    seen = set()
+    dup = set()
+    for s in seqs:
+        (dup if s in seen else seen).add(s)
+    if dup:
         return {"tail": tail, "status": "error", "errors": [
-            {"row": None, "messages": [f"机尾 {tail} 的航段顺序 seq 重复: {dup}"]}]}
+            {"row": None, "messages": [
+                f"机尾 {tail} 的航段顺序 seq 重复: {sorted(dup)}"]}]}
 
     segments.sort(key=lambda s: s.seq)
     base = {"tail": tail, "segments": [_segment_view(s) for s in segments]}
 
-    solutions, truncated = enumerate_solutions(segments)
-    if len(solutions) == 1:
+    status, payload = solve_chain(segments)
+    if status == "unique":
         return {**base, "status": "unique",
-                "solution": _solution_view(solutions[0], segments)}
-    if not solutions:
+                "solution": _solution_view(payload["solution"], segments)}
+    if status == "no_solution":
         return {**base, "status": "no_solution",
-                "conflict": analyze_conflict(segments)}
+                "conflict": payload["conflict"]}
     return {
         **base,
         "status": "multiple",
-        "solution_count": len(solutions),
-        "solution_count_truncated": truncated,
+        "solution_count": payload["solution_count"],
+        "solution_count_truncated": payload["solution_count_truncated"],
         "solutions": [_solution_view(s, segments)
-                      for s in solutions[:MAX_DISPLAY_SOLUTIONS]],
+                      for s in payload["solutions"][:MAX_DISPLAY_SOLUTIONS]],
     }
 
 

@@ -91,6 +91,7 @@
     <div class="upload-bar">
       <input type="file" id="fileInput" accept=".csv,text/csv">
       <button class="secondary" id="sampleBtn">📦 载入内置夏令时样例</button>
+      <button class="secondary" id="longSampleBtn">🧵 载入 1200 段长链样例</button>
       <button id="solveBtn" disabled>开始清洗</button>
       <span class="file-name" id="fileName">未选择文件</span>
       <span class="spacer"></span>
@@ -142,14 +143,18 @@ $('fileInput').addEventListener('change', (e) => {
   $('solveBtn').disabled = !currentFile;
 });
 
-$('sampleBtn').addEventListener('click', async () => {
-  const resp = await fetch('/api/sample');
+$('sampleBtn').addEventListener('click', () => loadSample('/api/sample', 'dst_sample.csv'));
+$('longSampleBtn').addEventListener('click',
+  () => loadSample('/api/sample/long', 'long_chain_sample.csv'));
+
+async function loadSample(url, name) {
+  const resp = await fetch(url);
   const blob = await resp.blob();
-  currentFile = new File([blob], 'dst_sample.csv', {type: 'text/csv'});
-  $('fileName').textContent = '已载入内置样例 dst_sample.csv';
+  currentFile = new File([blob], name, {type: 'text/csv'});
+  $('fileName').textContent = '已载入样例 ' + name;
   $('solveBtn').disabled = false;
   $('fileInput').value = '';
-});
+}
 
 $('solveBtn').addEventListener('click', async () => {
   hideGlobalError();
